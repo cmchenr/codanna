@@ -25,6 +25,36 @@ use tantivy::{
     },
 };
 
+/// Calculate optimal heap size based on system memory and configuration
+pub fn calculate_optimal_heap_size(config_mb: u32) -> usize {
+    if config_mb == 0 {
+        // Auto-detect based on available memory
+        if let Ok(mem_info) = sys_info::mem_info() {
+            let total_mb = (mem_info.total * 1024) / (1024 * 1024);
+            match total_mb {
+                0..=1000 => 15_000_000,      // 15MB (minimum)
+                1001..=2000 => 20_000_000,   // 20MB
+                2001..=4000 => 30_000_000,   // 30MB
+                4001..=8000 => 50_000_000,   // 50MB
+                _ => 100_000_000,            // 100MB for high-memory systems
+            }
+        } else {
+            20_000_000 // Fallback to 20MB
+        }
+    } else {
+        (config_mb as usize * 1_000_000).max(15_000_000) // At least 15MB (Tantivy minimum)
+    }
+}
+
+/// Get available system memory in MB
+pub fn get_available_memory_mb() -> u64 {
+    if let Ok(mem_info) = sys_info::mem_info() {
+        (mem_info.avail * 1024) / (1024 * 1024)
+    } else {
+        0
+    }
+}
+
 /// Schema fields for the document index
 #[derive(Debug)]
 pub struct IndexSchema {
@@ -756,9 +786,17 @@ impl DocumentIndex {
 
     /// Start a batch operation for adding multiple documents
     pub fn start_batch(&self) -> StorageResult<()> {
+        let heap_size = calculate_optimal_heap_size(0); // Auto-detect
+        self.start_batch_with_heap_size(heap_size)
+    }
+
+    /// Start a batch operation with custom heap size for adding multiple documents
+    pub fn start_batch_with_heap_size(&self, heap_size_bytes: usize) -> StorageResult<()> {
         let mut writer_lock = self.writer.lock().map_err(|_| StorageError::LockPoisoned)?;
         if writer_lock.is_none() {
-            let writer = self.index.writer::<Document>(100_000_000)?; // 100MB buffer
+            // Ensure minimum heap size (15MB is Tantivy's minimum)
+            let heap_size = heap_size_bytes.max(15_000_000);
+            let writer = self.index.writer::<Document>(heap_size)?;
             *writer_lock = Some(writer);
         }
         Ok(())
@@ -888,7 +926,7 @@ impl DocumentIndex {
         } else {
             // Create temporary writer for single operation
             drop(writer_lock); // Release lock before creating new writer
-            let mut writer = self.index.writer::<Document>(50_000_000)?;
+            let mut writer = self.index.writer::<Document>(20_000_000)?;
             writer.delete_term(term);
             writer.commit()?;
             self.reader.reload()?;
@@ -2578,7 +2616,7 @@ mod tests {
 
         // Create an in-memory index
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer(50_000_000).unwrap();
+        let mut index_writer = index.writer(20_000_000).unwrap();
 
         // Create test metadata
         let vector_id = VectorId::new(999).unwrap();
