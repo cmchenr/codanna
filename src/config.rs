@@ -83,6 +83,41 @@ pub struct IndexingConfig {
     /// Patterns to ignore during indexing
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+
+    /// Tantivy heap size in MB (0 = auto-detect based on available memory)
+    #[serde(default = "default_heap_size_mb")]
+    pub heap_size_mb: u32,
+
+    /// Advanced batching configuration
+    #[serde(default)]
+    pub batching: BatchingConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BatchingConfig {
+    /// Base batch size for initial indexing (large repos)
+    #[serde(default = "default_initial_batch_size")]
+    pub initial_batch_size: usize,
+
+    /// Batch size for watch mode (immediate feedback)
+    #[serde(default = "default_watch_batch_size")]
+    pub watch_batch_size: usize,
+
+    /// Maximum memory per batch in MB
+    #[serde(default = "default_max_batch_memory_mb")]
+    pub max_batch_memory_mb: u32,
+
+    /// Enable adaptive batch sizing based on available memory
+    #[serde(default = "default_true")]
+    pub adaptive_sizing: bool,
+
+    /// Emergency commit threshold in MB of available memory
+    #[serde(default = "default_emergency_memory_mb")]
+    pub emergency_memory_mb: u32,
+
+    /// Time-based commit interval in seconds (0 = disabled)
+    #[serde(default = "default_commit_interval_secs")]
+    pub commit_interval_secs: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -206,6 +241,32 @@ fn default_index_path() -> PathBuf {
 fn default_parallel_threads() -> usize {
     num_cpus::get()
 }
+fn default_heap_size_mb() -> u32 {
+    0  // 0 = auto-detect based on available memory
+}
+fn default_batch_size() -> usize {
+    100
+}
+
+fn default_initial_batch_size() -> usize {
+    100
+}
+
+fn default_watch_batch_size() -> usize {
+    1
+}
+
+fn default_max_batch_memory_mb() -> u32 {
+    200
+}
+
+fn default_emergency_memory_mb() -> u32 {
+    500
+}
+
+fn default_commit_interval_secs() -> u32 {
+    0
+}
 fn default_true() -> bool {
     true
 }
@@ -263,6 +324,20 @@ impl Default for IndexingConfig {
                 ".git/**".to_string(),
                 "*.generated.*".to_string(),
             ],
+            heap_size_mb: default_heap_size_mb(),
+            batching: BatchingConfig::default(),
+        }
+    }
+}
+impl Default for BatchingConfig {
+    fn default() -> Self {
+        Self {
+            initial_batch_size: default_initial_batch_size(),
+            watch_batch_size: default_watch_batch_size(),
+            max_batch_memory_mb: default_max_batch_memory_mb(),
+            adaptive_sizing: default_true(),
+            emergency_memory_mb: default_emergency_memory_mb(),
+            commit_interval_secs: default_commit_interval_secs(),
         }
     }
 }

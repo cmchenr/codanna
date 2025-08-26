@@ -1,3 +1,4 @@
+pub mod batch_manager;
 pub mod file_info;
 pub mod fs_watcher;
 pub mod progress;

@@ -2,13 +2,13 @@
 //! This version uses Tantivy as the single source of truth for all data
 
 use crate::indexing::{
-    FileWalker, IndexStats, IndexTransaction, calculate_hash, get_utc_timestamp,
+    batch_manager::AdaptiveBatchManager, FileWalker, IndexStats, IndexTransaction, calculate_hash, get_utc_timestamp,
 };
 use crate::parsing::resolution::ResolutionScope;
 use crate::parsing::{LanguageId, MethodCall, ParserFactory, get_registry};
 use crate::relationship::RelationshipMetadata;
 use crate::semantic::SimpleSemanticSearch;
-use crate::storage::{DocumentIndex, SearchResult};
+use crate::storage::{DocumentIndex, SearchResult, calculate_optimal_heap_size};
 use crate::types::SymbolCounter;
 use crate::vector::{EmbeddingGenerator, VectorSearchEngine, create_symbol_text};
 use crate::{
@@ -16,9 +16,10 @@ use crate::{
     SymbolKind,
 };
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Debug print macro that respects the debug setting
 macro_rules! debug_print {
@@ -328,6 +329,27 @@ impl SimpleIndexer {
                 operation: "start_batch".to_string(),
                 cause: e.to_string(),
             })
+    }
+
+    /// Start a batch operation for Tantivy indexing with custom heap size
+    pub fn start_tantivy_batch_with_heap_size(&self, heap_size_bytes: usize) -> IndexResult<()> {
+        self.document_index
+            .start_batch_with_heap_size(heap_size_bytes)
+            .map_err(|e| IndexError::TantivyError {
+                operation: "start_batch_with_heap_size".to_string(),
+                cause: e.to_string(),
+            })
+    }
+
+    /// Estimate memory impact of indexing a file (rough heuristic)
+    fn estimate_file_memory_impact(&self, file_path: &Path) -> f32 {
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            let size_mb = metadata.len() as f32 / (1024.0 * 1024.0);
+            // Rough estimate: indexing uses 2-5x the file size in memory
+            (size_mb * 3.0).max(0.1) // At least 0.1MB per file
+        } else {
+            0.5 // Default estimate
+        }
     }
 
     /// Commit the current Tantivy batch
@@ -1965,54 +1987,131 @@ impl SimpleIndexer {
             return Ok(stats);
         }
 
+        // Determine indexing mode based on file count and context
+        let is_watch_mode = total_files <= 5; // Small changes are likely watch mode
+        
+        // Create adaptive batch manager
+        let mut batch_manager = AdaptiveBatchManager::new(
+            Arc::new(self.settings.indexing.batching.clone()),
+            is_watch_mode,
+        );
+
+        // Calculate optimal heap size
+        let heap_size = calculate_optimal_heap_size(self.settings.indexing.heap_size_mb);
+
         let mut stats = IndexStats::new();
+        let mut batch_active = false;
+        let mut batch_start_time = Instant::now();
+        let overall_start_time = Instant::now(); // Track overall indexing time
 
-        // Process files one at a time with individual batches
-        let processed = Arc::new(AtomicUsize::new(0));
+        if progress {
+            if is_watch_mode {
+                eprintln!("Watch mode: Indexing {} files with immediate commits", total_files);
+            } else {
+                let batch_stats = batch_manager.get_stats();
+                eprintln!("Adaptive mode: {} files, {}MB heap, {}MB available", 
+                         total_files, heap_size / 1_000_000, batch_stats.available_memory_mb);
+            }
+        }
 
-        for file_path in files {
-            // Track files as they are processed
+        for (idx, file_path) in files.iter().enumerate() {
+            let is_last_file = idx == files.len() - 1;
 
-            {
-                // Start a new batch for this file
-                self.start_tantivy_batch()?;
+            // Start batch if needed
+            if !batch_active {
+                self.start_tantivy_batch_with_heap_size(heap_size)?;
+                batch_active = true;
+                batch_start_time = Instant::now();
+            }
 
-                match self.index_file_internal(&file_path, force) {
-                    Ok(result) => {
-                        // Commit this file's symbols so they're searchable
-                        self.commit_tantivy_batch()?;
+            // Estimate memory impact of this file
+            let file_memory_impact = self.estimate_file_memory_impact(&file_path);
 
-                        let file_id = result.file_id();
+            match self.index_file_internal(&file_path, force) {
+                Ok(result) => {
+                    let file_id = result.file_id();
 
-                        // Only count as indexed if it wasn't from cache
-                        if !result.is_cached() {
-                            stats.files_indexed += 1;
-
-                            // Update symbol count only for actually indexed files
-                            let new_symbols = self
-                                .document_index
-                                .find_symbols_by_file(file_id)
-                                .map(|symbols| symbols.len())
-                                .unwrap_or(0);
-                            stats.symbols_found += new_symbols;
-                        }
+                    // Only track files that weren't cached
+                    if !result.is_cached() {
+                        batch_manager.add_file(file_id, file_memory_impact);
+                        stats.files_indexed += 1;
                     }
-                    Err(e) => {
-                        eprintln!("Failed to index {}: {}", file_path.display(), e);
-                        stats.files_failed += 1;
-                        // Rollback is automatic
+                }
+                Err(e) => {
+                    // For errors, show them but don't clutter the main progress line
+                    if progress {
+                        eprint!("\r"); // Clear current line
+                        eprintln!("⚠️  Failed to index {}: {}", file_path.display(), e);
+                    }
+                    stats.files_failed += 1;
+                    // Still add to batch manager for memory tracking
+                    batch_manager.add_file(FileId(0), file_memory_impact);
+                }
+            }
+
+            // Check if we should commit this batch
+            if batch_manager.should_commit(is_last_file) {
+                let batch_processing_time = batch_start_time.elapsed();
+
+                // Commit the batch
+                self.commit_tantivy_batch()?;
+                batch_active = false;
+
+                // Complete the batch and get processed files
+                let processed_files = batch_manager.complete_batch(batch_processing_time);
+
+                // Efficient batch symbol counting - count symbols for all files at once
+                let batch_symbol_count = self.count_symbols_for_files(&processed_files)?;
+                stats.symbols_found += batch_symbol_count;
+
+                // Memory pressure warnings (only for severe cases)
+                if batch_manager.is_memory_pressure() {
+                    let available = batch_manager.get_stats().available_memory_mb;
+                    if available < 1000 { // Only warn if very low
+                        if progress {
+                            eprint!("\r"); // Clear current line
+                            eprintln!("⚠️  Memory pressure: {}MB available", available);
+                        }
                     }
                 }
             }
 
-            if progress {
-                let current = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                eprint!("\r{}", stats.progress_line(current, total_files));
+            // Continuous single-line progress updates
+            if progress && !is_watch_mode {
+                let current_progress = idx + 1;
+                let batch_stats = batch_manager.get_stats();
+                let percent = (current_progress * 100) / total_files;
+                
+                // Calculate ETA based on overall progress, not current batch
+                let elapsed = overall_start_time.elapsed().as_secs_f32();
+                let rate = if elapsed > 0.0 { current_progress as f32 / elapsed } else { 0.0 };
+                let eta_secs = if rate > 0.0 { 
+                    ((total_files - current_progress) as f32 / rate) as u64 
+                } else { 
+                    0 
+                };
+                let eta_mins = eta_secs / 60;
+                let eta_secs = eta_secs % 60;
+
+                eprint!("\rIndexing: {}/{} files ({}%) - {:.1} files/s - ETA: {}m {}s [{}MB available, batch: {}]",
+                       current_progress, total_files, percent, rate, eta_mins, eta_secs,
+                       batch_stats.available_memory_mb, batch_stats.files_in_batch);
+                
+                // Flush to ensure immediate display
+                let _ = io::stderr().flush();
+            } else if progress && is_watch_mode {
+                // For watch mode, show immediate feedback per file
+                eprint!("\rIndexed: {} ({}/{})", 
+                       file_path.file_name().unwrap_or_default().to_string_lossy(),
+                       idx + 1, total_files);
+                let _ = io::stderr().flush();
             }
         }
 
         if progress {
-            eprintln!(); // New line after progress
+            eprintln!(); // New line after progress completes
+            eprintln!("✅ Indexing completed: {} files indexed, {} symbols found", 
+                     stats.files_indexed, stats.symbols_found);
         }
 
         // Resolve cross-file relationships after all files are indexed
@@ -2021,6 +2120,17 @@ impl SimpleIndexer {
         }
 
         Ok(stats)
+    }
+
+    /// Count symbols for a batch of files efficiently  
+    fn count_symbols_for_files(&self, file_ids: &[FileId]) -> IndexResult<usize> {
+        let mut total_symbols = 0;
+        for &file_id in file_ids {
+            if let Ok(symbols) = self.document_index.find_symbols_by_file(file_id) {
+                total_symbols += symbols.len();
+            }
+        }
+        Ok(total_symbols)
     }
 
     // RESOLUTION SYSTEM: State reconstruction removed
@@ -2171,6 +2281,13 @@ impl SimpleIndexer {
             return Ok(());
         }
 
+        // Show progress for relationship resolution
+        eprint!("\rResolving {} cross-file relationships...", unresolved.len());
+        let _ = io::stderr().flush();
+        
+        // Track timing for relationship resolution progress
+        let relationship_start_time = Instant::now();
+
         // Start a batch for relationship updates
         self.start_tantivy_batch()?;
 
@@ -2191,11 +2308,17 @@ impl SimpleIndexer {
         }
 
         // Process each file's relationships with its resolution context
+        let _total_files = relationships_by_file.len();
+        let mut _processed_files = 0;
+        let mut processed_relationships = 0;
+        
         for (file_id, file_relationships) in relationships_by_file {
+            _processed_files += 1;
             // Build resolution context for this file
             let context = self.build_resolution_context(file_id)?;
 
             for rel in file_relationships {
+                processed_relationships += 1;
                 debug_print!(
                     self,
                     "Processing relationship: {} -> {} (kind: {:?}, file: {:?})",
@@ -2365,12 +2488,37 @@ impl SimpleIndexer {
                     self.add_relationship_internal(from_symbol.id, to_symbol.id, relationship)?;
                     resolved_count += 1;
                 }
+                
+                // Show progress every 100 relationships for more frequent updates
+                if processed_relationships % 100 == 0 || processed_relationships == _total_unresolved {
+                    let percent = (processed_relationships * 100) / _total_unresolved;
+                    
+                    // Calculate speed and ETA for relationship resolution
+                    let elapsed = relationship_start_time.elapsed().as_secs_f32();
+                    let rate = if elapsed > 0.0 { processed_relationships as f32 / elapsed } else { 0.0 };
+                    let eta_secs = if rate > 0.0 {
+                        ((_total_unresolved - processed_relationships) as f32 / rate) as u64
+                    } else {
+                        0
+                    };
+                    let eta_mins = eta_secs / 60;
+                    let eta_secs = eta_secs % 60;
+                    
+                    eprint!("\rResolving relationships: {}/{} ({}%) - {:.1} rels/s - ETA: {}m {}s - {} resolved, {} skipped", 
+                           processed_relationships, _total_unresolved, percent, rate, eta_mins, eta_secs, resolved_count, skipped_count);
+                    let _ = io::stderr().flush();
+                }
             }
         }
 
         // Commit the batch with all the relationships
         self.commit_tantivy_batch()?;
 
+        // Clear progress line and show final result
+        eprint!("\r");
+        eprintln!("✅ Relationships resolved: {} created, {} skipped from {} candidates", 
+                 resolved_count, skipped_count, _total_unresolved);
+        
         debug_print!(
             self,
             "Relationship resolution complete - resolved: {}, skipped: {}, total: {}",

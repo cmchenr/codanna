@@ -9,4 +9,4 @@ pub use error::{StorageError, StorageResult};
 pub use metadata::{DataSource, IndexMetadata};
 pub use metadata_keys::MetadataKey;
 pub use persistence::IndexPersistence;
-pub use tantivy::{DocumentIndex, SearchResult};
+pub use tantivy::{DocumentIndex, SearchResult, calculate_optimal_heap_size};
