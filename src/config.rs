@@ -244,9 +244,6 @@ fn default_parallel_threads() -> usize {
 fn default_heap_size_mb() -> u32 {
     0  // 0 = auto-detect based on available memory
 }
-fn default_batch_size() -> usize {
-    100
-}
 
 fn default_initial_batch_size() -> usize {
     100
