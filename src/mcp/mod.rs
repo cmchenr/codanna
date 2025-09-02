@@ -25,7 +25,7 @@ pub mod watcher;
 
 use rmcp::{
     ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ErrorData as McpError, *},
     schemars,
     service::{Peer, RequestContext, RoleServer},
@@ -33,7 +33,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 

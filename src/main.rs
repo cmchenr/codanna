@@ -1743,7 +1743,7 @@ async fn main() {
 
             // Call the tool directly
             use codanna::mcp::*;
-            use rmcp::handler::server::tool::Parameters;
+            use rmcp::handler::server::wrapper::Parameters;
 
             let result = match tool.as_str() {
                 "find_symbol" => {
